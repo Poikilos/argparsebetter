@@ -5,6 +5,8 @@ import os
 
 me = os.path.basename(sys.argv[0])
 iAmModule = os.path.splitext(me)[0]
+if me == "__init__.py":
+    iAmModule = "argparsebetter"
 
 
 def error(*args, **kwargs):
