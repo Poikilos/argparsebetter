@@ -33,8 +33,13 @@ class BetterArgParser:
         Do not use this in logic since the only reason to do that would
         be for lookahead and that is not recommended since it breaks
         logic.
-    _active_values -- values that were ever set on the current run of
-        parse (reset on initialize or unparse).
+    _arg_of_var -- This dictionary looks up which argument last set
+        the metavar (in the current run--reset on initialize or
+        unparse). Since the key is the metavar name, the value is the
+        raw argument. The presence of a key can be used to prevent
+        args that are mutually exclusive from setting the same value
+        twice.
+    _used_args -- This set determines which args were ever used.
     '''
     def __init__(self, description=None):
         self.cmd = "<this_program> "
@@ -46,7 +51,15 @@ class BetterArgParser:
         self.verbose = False
         self.description = None
         self._groups = {}
+        self._debug_fmt = "{}"  # "[debug] {}\n"
         self.unparse()
+
+    def get(self, metavar):
+        '''
+        Sequential arguments:
+        metavar -- Lookup the value for this metavar name.
+        '''
+        return self._values.get(metavar)
 
     def get_aliases(self, arg):
         aliases = []
@@ -63,7 +76,7 @@ class BetterArgParser:
     def debug(self, msg):
         if not self.verbose:
             return
-        sys.stderr.write("{}\n".format(msg))
+        sys.stderr.write(self._debug_fmt.format(msg))
         sys.stderr.flush()
 
     def unparse(self):
@@ -72,13 +85,32 @@ class BetterArgParser:
         self._save_key = None
         self._default_key = None
         self._parsing_args = None
-        self._active_values = set([])
+        self._arg_of_var = {}
+        self._used_args = set([])
 
-    def append_as(self, name, value):
-        if self._values.get(name) is None:
-            self._values[name] = [value]
+    def append_as(self, metavar, value):
+        if metavar != self._default_key:
+            meta = None
+            real_args = self._lookup_args.get(metavar)
+            if real_args is not None:
+                if len(real_args) > 0:
+                    meta = self._arg_metas.get(real_args[0])
+            if meta is None:
+                raise ValueError("{} was not defined via add_argument"
+                                 " before setting it to {}"
+                                 "".format(metavar, value))
+            elif meta.get('collect') is not True:
+                raise ValueError("{} must be defined as a list before"
+                                 " trying to append {} to it (It must"
+                                 " be defined with collect=True when"
+                                 " add_argument is called)."
+                                 "".format(metavar, value))
+
+        if self._values.get(metavar) is None:
+            self._values[metavar] = [value]
         else:
-            self._values[name].append(value)
+            self._values[metavar].append(value)
+
 
     def append_to_group(self, name, value):
         if self._groups.get(name) is None:
@@ -95,17 +127,37 @@ class BetterArgParser:
         else:
             self._lookup_args[metavar].append(arg)
 
+    def is_arg_used(self, arg):
+        '''
+        Return True if the arg was used
+        '''
+        return arg in self._used_args
+
+    def is_metavar_set(self, metavar):
+        '''
+        Return True if the arg was used
+        '''
+        return metavar in self._arg_of_var.keys()
+
     def add_argument(self, arg, metavar=None, value=None, help=None,
             group=None, required=False, as_list=False, after=None,
-            collect=False, mutually_exclusive=True):
+            collect=False, mutually_exclusive=None):
         '''
         Keyword arguments:
+        metavar -- Set the key for the _values dict that will be used.
         group -- reserved for future use (not implemented fully)
         collect -- Collect a list instead of setting a value.
         mutually_exclusive -- If multiple args affect the same metavar,
             do not allow more than one of the args when
-            mutually_exclusive is True.
+            mutually_exclusive is True. This should not be true if
+            collect is true, since collect uses the same metavar twice.
         '''
+        if mutually_exclusive is None:
+            mutually_exclusive = False if collect else True
+        elif mutually_exclusive is True:
+            if collect is True:
+                raise ValueError("Collecting multiple is impossible"
+                                 " if mutually_exclusive is true.")
         if arg is None:
             raise ValueError("arg must not be None.")
         name = metavar
@@ -217,23 +269,30 @@ class BetterArgParser:
     def formatOutOfSeq(self, got, expected_first):
         return "You can't do {} before {}".format(got, expected_first)
 
-    def _parse_arg(self, arg):
-        p = "  "  # line prefix
+    def _set_var(self, metavar, value, arg):
+        '''
+        Sequential args:
+        metavar -- The named value to set.
+        arg -- Specify the raw arg that sets the key. The arg is
+            necessary for tracing in error messages.
+        '''
+        meta = self._arg_metas[arg]
+        if meta.get('mutually_exclusive') is True:
+            by_arg = self._arg_of_var.get(metavar)
+            if by_arg is not None:
+                raise ValueError("{} is already set via {}."
+                                 "".format(metavar, by_arg))
+        if meta.get('collect') is True:
+            self.append_as(metavar, value)
+        else:
+            self._values[metavar] = value
+        self._arg_of_var[metavar] = arg
 
+    def _parse_arg(self, arg):
         if self._save_key is not None:
-            real_args = self._lookup_args.get(self._save_key)
-            meta = None
-            if real_args is not None:
-                if len(real_args) > 0:
-                    self._arg_metas.get(real_args[0])
-            if meta is not None:
-                if meta.get('mutually_exclusive') is True:
-                    if self._save_key in self._active_values:
-                        raise ValueError("{} is already set."
-                                         "".format(self._save_key))
-            self._values[self._save_key] = arg
-            self._active_values.add(self._save_key)
+            self._set_var(self._save_key, arg, self._save_key_arg)
             self._save_key = None
+            self._save_key_arg = None
             return True
         meta = self._arg_metas.get(arg)
         if meta is None:
@@ -243,7 +302,7 @@ class BetterArgParser:
                 self.append_as(self._default_key, arg)
                 return True
             else:
-                self.debug(p+"{} is not an arg and"
+                self.debug("{} is not an arg and"
                            " there is no default_key (command: {})."
                            "".format(arg, self._parsing_args))
                 return False
@@ -252,13 +311,32 @@ class BetterArgParser:
             if self._values.get(after) is None:
                 raise ValueError(self.formatOutOfSeq(arg, after))
         value = meta.get('value')
+        name = meta.get('metavar')
+        if name is None:
+            raise RuntimeError("metavar should be set for {arg}"
+                               " (to {arg} by default)"
+                               "".format(arg=arg))
         if value is None:
-            # Use the next arg as the value.
             self._save_key = meta.get('metavar')
+            self._save_key_arg = arg
             if self._save_key is None:
                 self._save_key = arg
+            # Don't set anything yet (Use the next arg as the value).
         else:
-            self._values[arg] = value
+            if meta.get('mutually_exclusive') is True:
+                by_arg = self._arg_of_var.get(name)
+                if by_arg is not None:
+                    # ^ Use self._arg_of_var instead of
+                    #   getting the value, because even they key
+                    #   present with the value None isn't allowed.
+                    raise ValueError("The {} value was already set via"
+                                     " {}".format(name, by_arg))
+            self._set_var(name, value, arg)
+        self._used_args.add(arg)
+        aliases = self.get_aliases(arg)
+        if aliases is not None:
+            for alias in aliases:
+                self._used_args.add(alias)
         self._prev_arg = arg
         return True
 
@@ -279,7 +357,7 @@ class BetterArgParser:
                 error("{} is not a valid argument.".format(arg))
         if self._save_key is not None:
             raise ValueError("You must specify a value after {}"
-                             "".format(self._save_key))
+                             "".format(self._save_key_arg))
         self._prev_arg = None
         self._parsing_args = None
 
@@ -355,6 +433,17 @@ def tests():
     error("OK")
     parser.unparse()
 
+    sys.stderr.write("* testing to ensure an alias sets both...")
+    parser.parse_args(
+        ["enissue.py", "Bucket_Game", "--debug"],
+        default_key="labels",
+    )
+    assert parser.is_arg_used("--verbose"), "--debug should also mark --verbose as used. parser.get_aliases('--verbose'): {}; parser._used_args: {}".format(parser.get_aliases('--verbose'), parser._used_args)
+    error("OK")
+    parser.unparse()
+
+
+
     # Should raise ValueError:
     sys.stderr.write("  * testing it before the expected arg...")
     expectedEx = parser.formatOutOfSeq("AND", "find")
@@ -378,10 +467,15 @@ def tests():
         )
         raise RuntimeError("mutually_exclusive=True by default so using two args with the same metavar should raise a ValueError but didn't.")
     except ValueError:
-        error("OK (raised ValueError as expected)")
+        sys.stderr.write("(raised ValueError as expected)...")
     expected_labels_s = "Bucket_Game,bug"
     assert ",".join(parser._values['labels']) == expected_labels_s, "Args without context should be appended as labels."
     error("OK (labels={})".format(expected_labels_s))
+    assert parser.get('state') == 'closed', "The `closed` command should set the state metavar to \"closed\"."
+    error("* variables:")
+    for k,v in parser._values.items():
+        error("  {}: {}".format(k, v))
+
 
 
 testMsg = """
